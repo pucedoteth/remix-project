@@ -19,7 +19,7 @@
 
 ```
 remix-project/
-├── apps/                       # 13 deployable apps (each with project.json)
+├── apps/                       # 13 app directories (11 with an Nx project.json)
 │   ├── remix-ide/              # Main web IDE (default project)
 │   ├── remixdesktop/           # Electron desktop app (own package.json + build)
 │   ├── remix-ide-e2e/          # Nightwatch E2E tests + helpers/commands
@@ -32,7 +32,7 @@ remix-project/
 │   ├── solhint/                # Solhint linter plugin
 │   ├── solidity-compiler/      # Solidity compiler plugin
 │   └── vyper/                  # Vyper compiler plugin
-├── libs/                       # 20 shared libraries
+├── libs/                       # 19 shared libraries
 │   ├── remix-ai-core/          # AI features, agents, MCP server ⭐
 │   ├── remix-analyzer/         # Static analysis & security checks
 │   ├── remix-api/              # Plugin API type contracts
@@ -45,7 +45,7 @@ remix-project/
 │   ├── remix-simulator/        # In-browser EVM/JSON-RPC simulator
 │   ├── remix-solidity/         # Compiler management
 │   ├── remix-tests/            # Solidity unit testing framework
-│   ├── remix-ui/               # React component library (60 sub-packages)
+│   ├── remix-ui/               # React component library (58 sub-packages)
 │   ├── remix-url-resolver/     # URL-based source resolution
 │   ├── remix-ws-templates/     # Workspace templates
 │   ├── remix-zkverify-core/    # zk verification support
@@ -57,7 +57,7 @@ remix-project/
 └── docs/                       # Internal specs (E2E account pool, API manifests)
 ```
 
-Nx project configuration lives in per-project `project.json` files (26 of them). Root `projects.json` is a **generated dep-graph dump**, not hand-edited config.
+Nx project configuration lives in per-project `project.json` files (27 of them). Root `projects.json` is a **generated dep-graph dump**, not hand-edited config.
 
 ### Key Libraries to Know
 
@@ -84,9 +84,9 @@ Nx project configuration lives in per-project `project.json` files (26 of them).
 
 **remix-api**: shared TypeScript contracts for plugin APIs (e.g. `PermissionsResponse` in `libs/remix-api/src/lib/plugins/api-types.ts`).
 
-**remix-ui**: 60 independently-aliased React packages (`@remix-ui/<name>`), e.g. `editor`, `terminal`, `workspace`, `run-tab*`, `remix-ai-assistant`, `top-bar`, `statusbar`, `plan-manager`, `git`, `walkthrough`, `quick-dapp-v2`, `template-explorer-modal`.
+**remix-ui**: 58 independently-aliased React packages (`@remix-ui/<name>`), e.g. `editor`, `terminal`, `workspace`, `run-tab*`, `remix-ai-assistant`, `top-bar`, `statusbar`, `plan-manager`, `git`, `walkthrough`, `quick-dapp-v2`, `template-explorer-modal`.
 
-**remix-ide-e2e**: Nightwatch E2E suite (109 test files) plus custom `commands/`, `helpers/`, `examples/`, and a local test plugin.
+**remix-ide-e2e**: Nightwatch E2E suite (106 `*.test.ts` files) plus custom `commands/`, `helpers/`, `examples/`, and a local test plugin.
 
 ## Development Commands
 
@@ -142,7 +142,7 @@ yarn format:check
 ## Important Patterns & Conventions
 
 ### File Organization
-- TypeScript path aliases (86 of them) live in `tsconfig.paths.json`, referenced from `tsconfig.base.json`.
+- TypeScript path aliases (87 of them) live in `tsconfig.paths.json`, referenced from `tsconfig.base.json`.
 - Import across library boundaries by alias, never relative paths: `@remix-project/<lib>`, `@remix-ui/<component>`, `@remix-api`, `@remix-git`, `@remix-endpoints-helper`.
 - `@nrwl/nx/enforce-module-boundaries` is an **error** in ESLint — cross-boundary relative imports will fail lint.
 - Each library has `src/`, `project.json`, `package.json`, `tsconfig.json`, and usually a `README.md`.
