@@ -4,7 +4,7 @@ import { remixAILogger } from '../../helpers/logger'
  * Integrates LangChain DeepAgent with Remix's AI system
  */
 
-import { createDeepAgent, CreateDeepAgentParams } from 'deepagents'
+import { createDeepAgent, createPatchToolCallsMiddleware, CreateDeepAgentParams } from 'deepagents'
 import { ICompletions, IGeneration, IParams } from '../../types/types'
 import { Plugin } from '@remixproject/engine'
 import EventEmitter from 'events'
@@ -30,11 +30,14 @@ import type { DeepAgent } from 'deepagents'
 import { RemixDeepAgentMiddleware } from './deepAgentMiddleWare'
 
 import './AsyncLocalStorageInit'
-import { createModelInstance } from './ModelFactory'
+import { createModelInstance, modelInstanceSupportsTools } from './ModelFactory'
+import { resolveCodeCapableSelection, syncModelCatalog } from './helpers/modelCatalog'
 import { generateStructured } from '../../helpers/structuredOutput'
 import { SecurityCheckSchema } from '../../types/schemas'
-import { getLangfuseCallbackHandler } from '../../helpers/langfuse'
+import { getLangfuseCallbackHandler, flushLangfuse } from '../../helpers/langfuse'
+import { setCurrentSessionId } from './helpers/runContext'
 import { buildSubagentConfigs } from './SubagentConfig'
+import { resolveHarnessProfile, applyHarnessToolRules } from './harnessProfiles'
 import { StreamEventHandler } from './StreamEventHandler'
 import { CONVERSATION_THREAD_PREFIX, DAPP_MAX_TOKENS } from '@remix/remix-ai-core'
 import { Features } from '@remix-api'
@@ -43,16 +46,14 @@ import { clearAllQuickDappWorkspaceLocks } from '@remix-ui/helper'
 import { clearAllQuickDappGenerationContexts } from '../../helpers/quickDappGenerationContext'
 import { clearQuickDappDocsContext } from '../../helpers/quickDappDocsContext'
 
-/** Model *families* too weak for code generation — subagents fall back to Sonnet.
- *  Matched as prefixes so both direct ids (`mistral-small-latest`) and
- *  OpenRouter's `vendor/slug` ids (`mistralai/mistral-small-2603`) hit. */
-export const notSuitableForCodeGeneration = ['mistral-medium', 'mistral-small', 'ministral-3b', 'ministral-8b']
-
-export function isUnsuitableForCodeGeneration(modelId: string): boolean {
-  if (!modelId) return false
-  const slug = modelId.includes('/') ? modelId.slice(modelId.indexOf('/') + 1) : modelId
-  return notSuitableForCodeGeneration.some((family) => slug.startsWith(family))
-}
+/**
+ * Whether a model is fit for code generation is now read from the backend
+ * catalogue's `capabilities` array via `modelSupportsCodeGeneration`, and the
+ * replacement model from `permissions.task_models` — see
+ * `helpers/modelCatalog`. The previous client-side family blacklist
+ * (`notSuitableForCodeGeneration`) went stale on every catalogue change and
+ * treated each newly added weak model as suitable until someone noticed.
+ */
 
 export class DeepAgentInferencer implements ICompletions, IGeneration {
   private plugin: Plugin
@@ -64,6 +65,9 @@ export class DeepAgentInferencer implements ICompletions, IGeneration {
   private tools: DynamicStructuredTool[] = []
   private approvalGate: ToolApprovalGate | undefined
   private currentAbortController: AbortController | null = null
+  /** Model-independent agent pieces, built once and reused across model swaps. */
+  private checkpointer: IndexedDBCheckpointSaver | null = null
+  private hasSkillsPermission: boolean | null = null
   private fallbackInferencer: any = null
   private model: BaseChatModel | null = null
   private modelSelection: ModelSelection
@@ -230,6 +234,9 @@ export class DeepAgentInferencer implements ICompletions, IGeneration {
     try {
       await this.logInitDiagnostics()
 
+      // Mirror the backend catalogue before building anything — it carries
+      // each model's token budget / temperature, which ModelFactory reads.
+      await syncModelCatalog(this.plugin)
       this.model = await createModelInstance(this.modelSelection, DAPP_MAX_TOKENS, this.userApiKeys)
 
       if (this.config.memoryBackend === 'store') {
@@ -472,11 +479,13 @@ export class DeepAgentInferencer implements ICompletions, IGeneration {
         this.event.emit('onInferenceDone')
         return response
       } catch (error: any) {
-        this.event.emit('onInferenceDone')
         if (error?.name === 'AbortError' || error?.message?.includes('cancelled')) {
+          this.event.emit('onInferenceDone')
           remixAILogger.log('[DeepAgentInferencer] Answer request was cancelled')
           return ''
         }
+
+        this.event.emit('onInferenceDone')
         remixAILogger.error('[DeepAgentInferencer] Answer error:', error)
         const envelope = aiErrorFromException(error)
         if (envelope && envelope.code !== 'INTERNAL_ERROR' && envelope.status > 0) {
@@ -620,6 +629,18 @@ export class DeepAgentInferencer implements ICompletions, IGeneration {
     this.currentAbortController = localAbortController
     let fullResponse = ''
 
+    // `config.timeout` was set in the constructor and then read by nothing, so
+    // a graph that stopped making progress ran forever. Enforce it here rather
+    // than via LangGraph's own `timeout` option: that one aborts through an
+    // internal signal and surfaces as the same anonymous `Error("Abort")` as
+    // everything else, whereas aborting our own controller lets us stamp a
+    // reason and tell a timeout apart from a user cancel.
+    const runTimeoutMs = this.config.timeout
+    const runTimeout = setTimeout(() => {
+      remixAILogger.warn(`[DeepAgentInferencer] run exceeded ${runTimeoutMs}ms — aborting`)
+      localAbortController.abort(new DOMException(`Agent run exceeded ${runTimeoutMs}ms without completing.`, 'TimeoutError'))
+    }, runTimeoutMs)
+
     // Filter out system messages - they're already set during agent creation
     const langchainMessages = messages
       .filter(msg => msg.role !== 'system')
@@ -643,6 +664,10 @@ export class DeepAgentInferencer implements ICompletions, IGeneration {
           DeepAgentErrorType.INITIALIZATION_FAILED
         )
       }
+
+      // Identity for this run: Langfuse traces and the OpenRouter
+      // `session_id` / `user` fields both key off it.
+      setCurrentSessionId(this.sessionThreadId)
 
       // Attach Langfuse tracing (no-op when disabled/unconfigured).
       const langfuseHandler = await getLangfuseCallbackHandler({
@@ -702,11 +727,61 @@ export class DeepAgentInferencer implements ICompletions, IGeneration {
 
       remixAILogger.log('[DeepAgentInferencer] Full response length:', fullResponse.length)
       return fullResponse
-    } catch (error: any) {
-      console.error('[DeepAgentInferencer] Error in runAgent:', error)
-      if (error?.name === 'AbortError' || localAbortController.signal.aborted) {
+    } catch (caught: any) {
+      console.error('[DeepAgentInferencer] Error in runAgent:', caught)
+      // Every abort used to be read as "the user cancelled", so a run that
+      // timed out or died on a transport abort silently returned whatever
+      // partial text it had — indistinguishable from a deliberate stop.
+      const abortReason: any = localAbortController.signal.aborted
+        ? localAbortController.signal.reason
+        : undefined
+      if (abortReason?.name === 'TimeoutError') {
+        throw new DeepAgentError(
+          abortReason.message || `Agent run exceeded ${runTimeoutMs}ms.`,
+          DeepAgentErrorType.REQUEST_TIMEOUT,
+          caught
+        )
+      }
+      if (caught?.name === 'AbortError' || localAbortController.signal.aborted) {
         remixAILogger.log('[DeepAgentInferencer] Request cancelled by user')
         return fullResponse
+      }
+
+      // Not our abort. `Error("Abort")` has exactly one source in LangGraph
+      // (`PregelRunner._executeTasksWithRetry`): a superstep starting while
+      // the composed abort signal is already aborted. That composed signal
+      // includes the runner's *exception* signal, which fires as soon as any
+      // node throws — so a node failure races the graph into an abort and the
+      // real cause (a 402, an upstream API error, a tool crash) is replaced by
+      // this meaningless message. The stream carried the real error on an
+      // *_error event; swap it back in so the classification below sees it.
+      let error: any = caught
+      if (caught?.message === 'Abort') {
+        const streamError = this.streamEventHandler.getStreamError()
+        if (streamError) {
+          remixAILogger.warn('[DeepAgentInferencer] graph aborted after a node error — reporting the cause', streamError)
+          error = streamError instanceof Error
+            ? streamError
+            : Object.assign(new Error(String(streamError?.message ?? streamError)), streamError)
+        } else {
+          // No node error was recorded, so the cause is genuinely lost. A bare
+          // `Error("Abort")` in the trace tells nobody anything — attach what
+          // we do know (model, thread, how far the stream got) so these are
+          // triageable, and keep the original as `cause`.
+          const streamed = fullResponse.length
+          error = Object.assign(
+            new Error(
+              `The agent run stopped unexpectedly (model ${this.modelSelection.modelId}, ` +
+              `thread ${this.sessionThreadId}, ${streamed} chars streamed). No underlying error was reported.`
+            ),
+            { cause: caught, name: 'AgentAbortError' }
+          )
+          remixAILogger.warn('[DeepAgentInferencer] graph aborted with no recorded node error', {
+            model: this.modelSelection.modelId,
+            thread: this.sessionThreadId,
+            streamedChars: streamed
+          })
+        }
       }
 
       // If ToolInputParsingException (stale multi-turn state), reset session and retry once
@@ -826,7 +901,11 @@ export class DeepAgentInferencer implements ICompletions, IGeneration {
 
       throw error
     } finally {
+      clearTimeout(runTimeout)
       clearQuickDappDocsContext()
+      // Best-effort trace delivery: the SDK drains only a slice of its queue
+      // per tick, so the tail of this run's trace needs an explicit push.
+      void flushLangfuse()
       this.streamEventHandler.stopInactivityTracking()
       // Only null out if still one of this run's controllers (a new request might have started)
       if (this.currentAbortController && thisRunControllers.has(this.currentAbortController)) {
@@ -908,64 +987,99 @@ export class DeepAgentInferencer implements ICompletions, IGeneration {
         )
       }
 
-      const checkpointer = new IndexedDBCheckpointSaver()
-      const hasSkillsPermission = await (async () => {
-        try {
-          return !!(await (this.plugin as any).call?.('assistantState', 'hasFeature', Features.AI_SKILLS))
-        } catch {
-          return false
-        }
-      })()
-
-      const systemPromptWithContext = REMIX_DEEPAGENT_SYSTEM_PROMPT
+      // Both of these are independent of the model, so a model swap must not
+      // rebuild them: the checkpointer owns an IndexedDB connection, and the
+      // permission is a plugin round-trip.
+      if (!this.checkpointer) this.checkpointer = new IndexedDBCheckpointSaver()
+      if (this.hasSkillsPermission === null) {
+        this.hasSkillsPermission = await (async () => {
+          try {
+            return !!(await (this.plugin as any).call?.('assistantState', 'hasFeature', Features.AI_SKILLS))
+          } catch {
+            return false
+          }
+        })()
+      }
+      const checkpointer = this.checkpointer
+      const hasSkillsPermission = this.hasSkillsPermission
+      const harnessProfile = resolveHarnessProfile(this.modelSelection)
 
       // Create agent configuration with selected tools
-      // Cast tools and model to any to handle @langchain/core version mismatch between root and deepagents
       const agentConfig: CreateDeepAgentParams = {
         backend: this.filesystemBackend as any,
         tools: [],
         model: this.model,
-        systemPrompt: systemPromptWithContext,
+        systemPrompt: {
+          base: REMIX_DEEPAGENT_SYSTEM_PROMPT,
+          ...(harnessProfile?.systemPromptSuffix ? { suffix: harnessProfile.systemPromptSuffix } : {})
+        },
         skills: hasSkillsPermission ? ["skills/"] : [],
         checkpointer,
-        middleware: [new RemixDeepAgentMiddleware(this.plugin, this)],
+        middleware: [createPatchToolCallsMiddleware(), new RemixDeepAgentMiddleware(this.plugin, this)],
       }
 
       if (this.config.enableSubagents && this.model) {
         let fallbackModel = this.model
-        if (isUnsuitableForCodeGeneration(this.modelSelection.modelId)) {
-          // Route the subagent fallback the same way as the active selection.
-          const fallbackSelection: ModelSelection = this.modelSelection.routeProvider === 'bedrock'
-            ? { provider: 'anthropic', modelId: 'us.anthropic.claude-sonnet-4-20250514-v1:0', routeProvider: 'bedrock' }
-            // OpenRouter is the default route, so the fallback uses its
-            // `vendor/slug` id form.
-            : { provider: 'anthropic', modelId: 'anthropic/claude-sonnet-5', routeProvider: 'openrouter' }
-          fallbackModel = await createModelInstance(fallbackSelection, DAPP_MAX_TOKENS, this.userApiKeys)
-          remixAILogger.log(`[DeepAgentInferencer] Using fallback model ${fallbackSelection.modelId} (route=${fallbackSelection.routeProvider ?? fallbackSelection.provider}) for subagents due to unsuitability of selected model ${this.modelSelection.modelId} for code generation`)
+        let subagentSelection = this.modelSelection
+        const codeCapable = await resolveCodeCapableSelection(this.plugin, this.modelSelection)
+        if (codeCapable) {
+          const candidate = await createModelInstance(codeCapable, DAPP_MAX_TOKENS, this.userApiKeys)
+          // Subagents bind tools on every request. A code-capable model that
+          if (modelInstanceSupportsTools(candidate)) {
+            fallbackModel = candidate
+            subagentSelection = codeCapable
+            remixAILogger.log(`[DeepAgentInferencer] Subagents use ${codeCapable.modelId} (route=${codeCapable.routeProvider ?? codeCapable.provider}); ${this.modelSelection.modelId} is not advertised as code-capable`)
+          } else {
+            remixAILogger.warn(`[DeepAgentInferencer] ${codeCapable.modelId} cannot call tools — subagents stay on ${this.modelSelection.modelId}`)
+          }
         }
-        agentConfig.subagents = await buildSubagentConfigs(
-          this.tools,
-          this.model,
-          this.filesystemBackend,
-          fallbackModel
-        )
-        let subagentsDesc = ''
-        agentConfig.subagents.forEach(sub => {
-          subagentsDesc += `\n- ${sub.name}:${sub.description || ''}`
-        })
-        agentConfig.systemPrompt += `\n\n## The agent has access to the following subagents:${subagentsDesc}`
+        // A subagent that cannot be built must not take the whole agent with
+        const subagentProfile = resolveHarnessProfile(subagentSelection)
+        const shapedTools = applyHarnessToolRules(this.tools, subagentProfile)
+        if (shapedTools.length !== this.tools.length) {
+          remixAILogger.log(
+            `[DeepAgentInferencer] harness profile for ${subagentSelection.modelId} hides ` +
+            `${this.tools.length - shapedTools.length} tool(s) from subagents`
+          )
+        }
+        try {
+          agentConfig.subagents = await buildSubagentConfigs(
+            shapedTools,
+            this.model,
+            this.filesystemBackend,
+            fallbackModel
+          )
+        } catch (subagentError) {
+          remixAILogger.error(
+            '[DeepAgentInferencer] Subagent configuration failed — continuing without subagents:',
+            subagentError
+          )
+          agentConfig.subagents = []
+        }
+        const subagentsDesc = agentConfig.subagents
+          .map(sub => `\n- ${sub.name}:${sub.description || ''}`)
+          .join('')
+        const roster = `## The agent has access to the following subagents:${subagentsDesc}`
+        const promptConfig = agentConfig.systemPrompt as { base?: string; suffix?: string | null }
+        promptConfig.suffix = promptConfig.suffix
+          ? `${roster}\n\n${promptConfig.suffix}`
+          : roster
       }
 
       if (this.memoryBackend) {
         agentConfig.store = this.memoryBackend as any
       }
 
-      // Cast result to any to handle @langchain/core version mismatch between root and deepagents
-      this.agent = createDeepAgent(agentConfig as any) as any
+      this.agent = createDeepAgent(agentConfig as any) as DeepAgent
 
       remixAILogger.log(`[DeepAgentInferencer] Recreated agent with ${selectedTools.length} selected tools`)
     } catch (error) {
       remixAILogger.error('[DeepAgentInferencer] Failed to recreate agent with selected tools:', error)
+      throw new DeepAgentError(
+        `Failed to build the agent: ${(error as any)?.message ?? error}`,
+        DeepAgentErrorType.INITIALIZATION_FAILED,
+        error
+      )
     }
   }
 
@@ -1051,7 +1165,9 @@ export class DeepAgentInferencer implements ICompletions, IGeneration {
   cancelRequest(): void {
     remixAILogger.log('[DeepAgentInferencer] Cancelling request...')
     if (this.currentAbortController) {
-      this.currentAbortController.abort()
+      // A reason makes the abort self-describing at the catch site, which is
+      // what lets a user cancel be told apart from a timeout.
+      this.currentAbortController.abort(new DOMException('The user cancelled the request.', 'AbortError'))
       this.currentAbortController = null
     }
     // Aborting the stream does NOT unblock a run that is parked on a HITL
