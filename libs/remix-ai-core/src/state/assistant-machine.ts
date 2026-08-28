@@ -20,7 +20,7 @@
 import { setup, createActor, type AnyActorRef } from 'xstate'
 import type { PermissionsResponse } from '@remix-api'
 import { Features } from '@remix-api'
-import { ANONYMOUS_FALLBACK_MODELS, parseAIModelsFromPermissions, curateOpenRouterBrandedModels, isOpenRouterRouted, isAutoModelId, type AIModel } from '../types/models'
+import { ANONYMOUS_FALLBACK_MODELS, parseAIModelsFromPermissions, curateOpenRouterBrandedModels, isOpenRouterRouted, type AIModel } from '../types/models'
 
 // ─── Public types ───────────────────────────────────────────────────
 
@@ -642,7 +642,7 @@ export function selectAvailableModels(snap: AssistantSnapshot): AIModel[] {
  * and the caller must wait (or reject loudly).
  */
 export function selectDefaultModel(snap: AssistantSnapshot): AIModel | null {
-  const models = selectAvailableModels(snap).filter((m) => !isAutoModelId(m.id))
+  const models = selectAvailableModels(snap)
   if (!models.length) return null
   // OpenRouter is the default router: among `available` rows flagged
   // is_default, an OpenRouter-routed one wins. Only when the backend advertises
@@ -686,11 +686,6 @@ export function selectTaskParam(
   const row = tp?.[taskId]
   if (!row || row[key] === undefined || row[key] === null) return null
   return row[key]
-}
-
-/** Sugar over selectFeatureEnabled — Auto Mode is just `ai:auto`. */
-export function selectAutoModeEnabled(snap: AssistantSnapshot): boolean {
-  return selectFeatureEnabled(snap, Features.AI_AUTO)
 }
 
 /**
@@ -853,6 +848,18 @@ export function selectChatNotice(snap: AssistantSnapshot): ChatNotice | null {
       code: err.code,
       title: 'AI service error',
       message: err.message || 'The AI service ran into an issue. Please try again.',
+      actionable: true
+    }
+  case 'MODEL_TOOLS_UNSUPPORTED':
+    // Client-side code, raised by the RemixAI plugin when the active model
+    // turns out not to support tool calling. It has already rolled the
+    // selection back — its message names the model that failed and the one
+    // restored, so prefer it over the generic line.
+    return {
+      severity: 'warning',
+      code: err.code,
+      title: 'Model not supported',
+      message: err.message || 'The selected model cannot call tools, which the assistant requires.',
       actionable: true
     }
   case 'BAD_REQUEST':
